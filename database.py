@@ -1,13 +1,13 @@
 """
-database.py — MySQL database creation, seeding, and schema introspection.
+database.py — SQLite database creation, seeding, and schema introspection.
 
 Responsibilities
 ----------------
-* Build the MySQL connection URL from individual environment variables.
-* Create the company_db database if it does not exist (using the admin engine).
+* Build a local SQLite connection URL.
+* Create the SQLite database file and required tables automatically.
 * Create and seed the Department, Employee, and Salary tables with realistic
   sample data if they do not already contain rows.
-* Expose a read-only SQLAlchemy engine for all SELECT query execution.
+* Expose a SQLAlchemy engine for validated SELECT query execution.
 * Introspect all tables and return a human-readable schema string for the LLM.
 """
 
@@ -15,7 +15,6 @@ import os
 import logging
 from datetime import date
 from typing import Optional
-from urllib.parse import quote_plus
 
 from sqlalchemy import (
     create_engine,
@@ -27,6 +26,7 @@ from sqlalchemy import (
     Date,
     Float,
     ForeignKey,
+    event,
 )
 from sqlalchemy.orm import DeclarativeBase, Session
 from dotenv import load_dotenv
@@ -154,221 +154,145 @@ _SALARIES = [
 ]
 
 
-# ─── Connection URL builder ───────────────────────────────────────────────────
+
+
+# ─── SQLite connection and engine ─────────────────────────────────────────────
 
 def get_database_url() -> str:
-    """Construct MySQL DATABASE_URL from individual environment variables.
+    """Return the SQLite database URL.
 
-    Reads:
-        DB_HOST     (default: localhost)
-        DB_PORT     (default: 3306)
-        DB_NAME     (default: company_db)
-        DB_USER     (default: root)
-        DB_PASSWORD (optional — URL-encoded automatically to handle special chars)
-
-    Returns a mysql+pymysql:// SQLAlchemy URL string.
+    SQLITE_DB_PATH can optionally override the database filename.
+    By default, company.db is created in the project directory.
     """
-    host     = os.getenv("DB_HOST", "localhost")
-    port     = os.getenv("DB_PORT", "3306")
-    name     = os.getenv("DB_NAME", "company_db")
-    user     = os.getenv("DB_USER", "root")
-    password = os.getenv("DB_PASSWORD", "")
-
-    # URL-encode the password so special characters (@ # % etc.) are handled safely.
-    if password:
-        encoded_pw = quote_plus(password)
-        auth = f"{user}:{encoded_pw}@"
-    else:
-        auth = f"{user}@"
-
-    return f"mysql+pymysql://{auth}{host}:{port}/{name}"
-
-
-def _validate_credentials() -> None:
-    """Raise a descriptive ValueError if MySQL credentials look unconfigured."""
-    password = os.getenv("DB_PASSWORD", "")
-    placeholder_values = {
-        "your_mysql_root_password_here",
-        "your_mysql_password",
-        "your_mysql_password_here",
-    }
-    if password in placeholder_values:
-        raise ValueError(
-            "DB_PASSWORD in your .env file is still a placeholder. "
-            "Please replace 'your_mysql_root_password_here' with your actual MySQL password."
-        )
-
-
-# ─── Engine factory ───────────────────────────────────────────────────────────
-
-def _make_admin_engine(host: str, port: str, user: str, password: str):
-    """Create an engine connected to the MySQL *server* (no specific database).
-
-    Used only during init to CREATE DATABASE IF NOT EXISTS.
-    """
-    encoded_pw = quote_plus(password) if password else ""
-    auth = f"{user}:{encoded_pw}@" if encoded_pw else f"{user}@"
-    server_url = f"mysql+pymysql://{auth}{host}:{port}/"
-    return create_engine(server_url, echo=False)
+    db_path = os.getenv("SQLITE_DB_PATH", "company.db")
+    if db_path == ":memory:":
+        return "sqlite://"
+    return f"sqlite:///{db_path}"
 
 
 def _make_engine(url: Optional[str] = None):
-    """Create a SQLAlchemy engine for the application database."""
-    url = url or get_database_url()
-    return create_engine(
-        url,
+    """Create a SQLAlchemy engine for SQLite."""
+    engine = create_engine(
+        url or get_database_url(),
         echo=False,
-        pool_pre_ping=True,     # detects stale connections automatically
-        pool_recycle=3600,      # recycle connections every hour
-        connect_args={
-            "connect_timeout": 10,
-            "charset": "utf8mb4",
-        },
+        connect_args={"check_same_thread": False},
     )
+
+    # Enforce SQLite foreign-key constraints on each new connection.
+    @event.listens_for(engine, "connect")
+    def _enable_foreign_keys(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    return engine
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
 
 def init_database(db_url: Optional[str] = None) -> None:
-    """Ensure the database, tables, and seed data all exist.
-
-    Steps:
-    1. Validate that credentials are not placeholders.
-    2. Connect to the MySQL *server* and CREATE DATABASE IF NOT EXISTS.
-    3. Connect to the target database and CREATE tables via SQLAlchemy ORM.
-    4. Seed data if the departments table is empty.
-    """
-    _validate_credentials()
-
-    host     = os.getenv("DB_HOST", "localhost")
-    port     = os.getenv("DB_PORT", "3306")
-    name     = os.getenv("DB_NAME", "company_db")
-    user     = os.getenv("DB_USER", "root")
-    password = os.getenv("DB_PASSWORD", "")
-
-    # ── Step 1: Create the database if it does not exist ─────────────────────
-    logger.info("Checking MySQL database '%s' …", name)
-    try:
-        admin_engine = _make_admin_engine(host, port, user, password)
-        with admin_engine.connect() as conn:
-            conn.execute(
-                text(f"CREATE DATABASE IF NOT EXISTS `{name}` "
-                     "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
-            )
-            conn.commit()
-        admin_engine.dispose()
-        logger.info("Database '%s' is ready.", name)
-    except Exception as exc:
-        raise ConnectionError(
-            f"Cannot connect to MySQL server at {host}:{port}. "
-            f"Check your DB_HOST, DB_PORT, DB_USER, and DB_PASSWORD in .env.\n"
-            f"Original error: {exc}"
-        ) from exc
-
-    # ── Step 2: Create tables ─────────────────────────────────────────────────
-    url    = db_url or get_database_url()
-    engine = _make_engine(url)
+    """Create SQLite tables and seed sample data when the tables are empty."""
+    engine = _make_engine(db_url)
     try:
         Base.metadata.create_all(engine)
-        logger.info("Tables created / verified.")
-    except Exception as exc:
-        engine.dispose()
-        raise ConnectionError(
-            f"Failed to create tables in '{name}'. Error: {exc}"
-        ) from exc
+        logger.info("SQLite tables created / verified.")
 
-    # ── Step 3: Seed data ─────────────────────────────────────────────────────
-    with Session(engine) as session:
-        try:
+        with Session(engine) as session:
             existing = session.execute(
                 text("SELECT COUNT(*) FROM departments")
-            ).scalar()
-        except Exception:
-            existing = 0
+            ).scalar() or 0
 
-        if existing == 0:
-            logger.info("Seeding database with sample data …")
-            session.execute(Department.__table__.insert(), _DEPARTMENTS)
-            session.execute(Employee.__table__.insert(),   _EMPLOYEES)
-            session.execute(Salary.__table__.insert(),     _SALARIES)
-            session.commit()
-            logger.info("Seeded %d departments, %d employees, %d salaries.",
-                        len(_DEPARTMENTS), len(_EMPLOYEES), len(_SALARIES))
-        else:
-            logger.info("Database already has data — skipping seed.")
-
-    engine.dispose()
+            if existing == 0:
+                logger.info("Seeding SQLite database with sample data...")
+                session.execute(Department.__table__.insert(), _DEPARTMENTS)
+                session.execute(Employee.__table__.insert(), _EMPLOYEES)
+                session.execute(Salary.__table__.insert(), _SALARIES)
+                session.commit()
+                logger.info(
+                    "Seeded %d departments, %d employees, and %d salaries.",
+                    len(_DEPARTMENTS), len(_EMPLOYEES), len(_SALARIES)
+                )
+            else:
+                logger.info("SQLite database already contains data; skipping seed.")
+    except Exception:
+        engine.dispose()
+        raise
+    finally:
+        engine.dispose()
 
 
 def get_read_engine(db_url: Optional[str] = None):
-    """Return a SQLAlchemy engine for read-only SELECT queries.
+    """Return a SQLAlchemy engine for query execution.
 
-    The application uses a standard user account.  Write operations are
-    blocked at the SQL validation layer in sql_agent.py.
+    SQL write operations must remain blocked by the validation layer in
+    sql_agent.py. SQLite is a local file database, not a remote service.
     """
-    url = db_url or get_database_url()
-    return _make_engine(url)
+    return _make_engine(db_url)
 
 
 def get_schema_info(db_url: Optional[str] = None) -> str:
-    """Introspect the MySQL database and return a compact schema string for the LLM."""
-    url     = db_url or get_database_url()
-    engine  = _make_engine(url)
-    inspector = inspect(engine)
+    """Inspect SQLite tables and return a schema description for the LLM."""
+    engine = _make_engine(db_url)
+    try:
+        inspector = inspect(engine)
+        table_names = inspector.get_table_names()
+        lines = ["DATABASE SCHEMA (SQLite)\n" + "=" * 50]
 
-    table_names = inspector.get_table_names()
-    lines = ["DATABASE SCHEMA (MySQL)\n" + "=" * 50]
+        for table_name in table_names:
+            lines.append(f"\nTable: {table_name}")
+            lines.append("-" * 30)
 
-    for table_name in table_names:
-        lines.append(f"\nTable: {table_name}")
-        lines.append("-" * 30)
+            for col in inspector.get_columns(table_name):
+                nullable = "" if col["nullable"] else " NOT NULL"
+                lines.append(
+                    f"  {col['name']:30s} {str(col['type']):20s}{nullable}"
+                )
 
-        columns = inspector.get_columns(table_name)
-        for col in columns:
-            nullable = "" if col["nullable"] else " NOT NULL"
-            lines.append(f"  {col['name']:30s} {str(col['type']):20s}{nullable}")
+            foreign_keys = inspector.get_foreign_keys(table_name)
+            if foreign_keys:
+                lines.append("  -- Foreign Keys --")
+                for fk in foreign_keys:
+                    local_cols = ", ".join(fk["constrained_columns"])
+                    ref_table = fk["referred_table"]
+                    ref_cols = ", ".join(fk["referred_columns"])
+                    lines.append(f"  {local_cols} -> {ref_table}.{ref_cols}")
 
-        # Foreign keys
-        fks = inspector.get_foreign_keys(table_name)
-        if fks:
-            lines.append("  -- Foreign Keys --")
-            for fk in fks:
-                local_cols = ", ".join(fk["constrained_columns"])
-                ref_table  = fk["referred_table"]
-                ref_cols   = ", ".join(fk["referred_columns"])
-                lines.append(f"  {local_cols} → {ref_table}.{ref_cols}")
-
-        # Row count hint
-        try:
             with engine.connect() as conn:
                 row_count = conn.execute(
-                    text(f"SELECT COUNT(*) FROM `{table_name}`")
+                    text(f'SELECT COUNT(*) FROM "{table_name}"')
                 ).scalar()
             lines.append(f"  -- ~{row_count} rows --")
-        except Exception:
-            pass
 
-    engine.dispose()
-    return "\n".join(lines)
+        return "\n".join(lines)
+    finally:
+        engine.dispose()
 
 
-def get_table_sample(table_name: str, limit: int = 3, db_url: Optional[str] = None) -> str:
-    """Return a few sample rows from `table_name` as a formatted string."""
-    url    = db_url or get_database_url()
-    engine = _make_engine(url)
+def get_table_sample(
+    table_name: str, limit: int = 3, db_url: Optional[str] = None
+) -> str:
+    """Return a few sample rows from a SQLite table."""
+    # Table names are selected from SQLAlchemy's inspector, not user input.
+    engine = _make_engine(db_url)
     try:
+        inspector = inspect(engine)
+        if table_name not in inspector.get_table_names():
+            return f"(unknown table: {table_name})"
+
         with engine.connect() as conn:
             rows = conn.execute(
-                text(f"SELECT * FROM `{table_name}` LIMIT :lim"),
+                text(f'SELECT * FROM "{table_name}" LIMIT :lim'),
                 {"lim": limit},
             ).fetchall()
+
         if not rows:
             return f"(no rows in {table_name})"
+
         col_names = list(rows[0]._mapping.keys())
         header = " | ".join(col_names)
-        sep    = "-" * len(header)
-        body   = "\n".join(" | ".join(str(v) for v in row) for row in rows)
-        return f"{header}\n{sep}\n{body}"
+        separator = "-" * len(header)
+        body = "\n".join(" | ".join(str(value) for value in row) for row in rows)
+        return f"{header}\n{separator}\n{body}"
     except Exception as exc:
         return f"(error sampling {table_name}: {exc})"
     finally:

@@ -18,6 +18,17 @@ from sql_agent import TextToSQLAgent
 
 # ─── Bootstrap ────────────────────────────────────────────────────────────────
 load_dotenv()
+
+# Streamlit Community Cloud stores secrets in st.secrets.
+# Local development continues to use the project's .env file.
+try:
+    for secret_name in ("LLM_PROVIDER", "GROQ_API_KEY", "GROQ_MODEL"):
+        if secret_name in st.secrets:
+            os.environ[secret_name] = str(st.secrets[secret_name])
+except Exception:
+    # st.secrets may be unavailable during local development.
+    pass
+
 logging.basicConfig(level=logging.INFO)
 
 # ─── Page config ──────────────────────────────────────────────────────────────
@@ -268,67 +279,33 @@ def render_sidebar():
             unsafe_allow_html=True,
         )
 
-        # Provider info
         provider = os.getenv("LLM_PROVIDER", "groq").upper()
-        model_env = os.getenv(
-           "GROQ_MODEL",
-           "openai/gpt-oss-120b"
-        )
+        model_env = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+        api_key_configured = bool(os.getenv("GROQ_API_KEY", "").strip())
+
         st.markdown(
             f"""
 <div class="sidebar-section">
   <b>🤖 LLM Provider</b><br/>
   <code>{provider}</code> · <code>{model_env}</code><br/><br/>
-  <b>🔑 API Key</b><br/>
-  Set in <code>.env</code> file<br/>
+  <b>🔑 Groq API Key</b><br/>
+  <span class="badge {'badge-success' if api_key_configured else 'badge-warning'}">
+    {'Configured' if api_key_configured else 'Not configured'}
+  </span><br/><br/>
+  <b>🗄️ Database</b><br/>
+  <code>SQLite</code> · Local application database
 </div>
 """,
             unsafe_allow_html=True,
         )
 
-        # MySQL connection fields (password masked)
+        st.markdown("---")
         st.markdown(
             "<div style='color:#c084fc;font-size:.8rem;font-weight:600;"
-            "letter-spacing:.06em;text-transform:uppercase;margin-bottom:.4rem;'>"
-            "🗄️ MySQL Configuration</div>",
+            "letter-spacing:.06em;text-transform:uppercase;margin-bottom:.6rem;'>"
+            "📋 Database Schema</div>",
             unsafe_allow_html=True,
         )
-        db_host     = st.text_input("Host",     value=os.getenv("DB_HOST", "localhost"), key="db_host")
-        db_port     = st.text_input("Port",     value=os.getenv("DB_PORT", "3306"),      key="db_port")
-        db_name     = st.text_input("Database", value=os.getenv("DB_NAME", "company_db"),key="db_name")
-        db_user     = st.text_input("User",     value=os.getenv("DB_USER", "root"),      key="db_user")
-        # Password is never shown in the UI — the placeholder just tells the user it's set.
-        _pw_set     = bool(os.getenv("DB_PASSWORD", ""))
-        db_password = st.text_input(
-            "Password",
-            type="password",
-            placeholder="••••••••" if _pw_set else "Enter MySQL password",
-            key="db_password",
-        )
-        if st.button("🔌 Apply & Reconnect", use_container_width=True):
-            os.environ["DB_HOST"] = db_host
-            os.environ["DB_PORT"] = db_port
-            os.environ["DB_NAME"] = db_name
-            os.environ["DB_USER"] = db_user
-            # Only update the password if the user typed something new
-            if db_password:
-                os.environ["DB_PASSWORD"] = db_password
-            st.session_state.db_url = get_database_url()
-            st.session_state.agent  = None   # force re-create on next query
-            try:
-                init_database(st.session_state.db_url)
-                st.success("✅ Connected to MySQL!")
-            except ConnectionError as e:
-                st.error(f"🔌 Connection failed: {e}")
-            except ValueError as e:
-                st.warning(f"⚙️ Configuration: {e}")
-            except Exception as e:
-                st.error(f"❌ Unexpected error: {e}")
-
-        st.markdown("---")
-
-        # Schema viewer
-        st.markdown("<div style='color:#c084fc;font-size:.8rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;margin-bottom:.6rem;'>📋 Schema</div>", unsafe_allow_html=True)
         with st.expander("View database schema"):
             try:
                 schema = get_schema_info(st.session_state.db_url)
@@ -338,23 +315,28 @@ def render_sidebar():
 
         st.markdown("---")
 
-        # Query history
         if st.session_state.history:
-            st.markdown("<div style='color:#c084fc;font-size:.8rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;margin-bottom:.6rem;'>📜 Recent Queries</div>", unsafe_allow_html=True)
+            st.markdown(
+                "<div style='color:#c084fc;font-size:.8rem;font-weight:600;"
+                "letter-spacing:.06em;text-transform:uppercase;margin-bottom:.6rem;'>"
+                "📜 Recent Queries</div>",
+                unsafe_allow_html=True,
+            )
             for i, h in enumerate(reversed(st.session_state.history[-8:])):
                 icon = "✅" if h["success"] else "❌"
-                if st.button(
-                    f"{icon} {h['question'][:42]}…" if len(h["question"]) > 42 else f"{icon} {h['question']}",
-                    key=f"hist_{i}",
-                    use_container_width=True,
-                ):
+                label = (
+                    f"{icon} {h['question'][:42]}…"
+                    if len(h["question"]) > 42
+                    else f"{icon} {h['question']}"
+                )
+                if st.button(label, key=f"hist_{i}", use_container_width=True):
                     st.session_state.question = h["question"]
 
         st.markdown("---")
         st.markdown(
             "<div style='font-size:.72rem;color:#8b949e;text-align:center;'>"
             "Text-to-SQL Agent · powered by LangChain<br/>"
-            "Only SELECT queries execute safely.</div>",
+            "SQLite database · Only SELECT queries execute safely.</div>",
             unsafe_allow_html=True,
         )
 
@@ -515,40 +497,21 @@ def main():
     render_sidebar()
     render_hero()
 
-    # Ensure DB is initialised
-    with st.spinner("Connecting to MySQL database …"):
+    # Create the SQLite database and seed sample records if needed.
+    with st.spinner("Initializing SQLite database …"):
         try:
             init_database(st.session_state.db_url)
-        except ValueError as e:
-            st.error(f"⚙️ Configuration error: {e}")
-            st.info(
-               "Please update your `.env` file with real values for:\n"
-               "- `GROQ_API_KEY` — your Groq API key\n"
-               "- `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` — your MySQL credentials"
-            )
-            st.stop()
-        except ConnectionError as e:
-            st.error(f"🔌 MySQL connection failed: {e}")
-            st.info(
-                "Make sure:\n"
-                "1. MySQL service is running (check Windows Services → MySQL80)\n"
-                "2. `DB_USER` and `DB_PASSWORD` in `.env` match your MySQL credentials\n"
-                "3. Use the sidebar '🔌 Apply & Reconnect' button after updating `.env`"
-            )
-            st.stop()
         except Exception as e:
-            st.error(f"Database initialisation failed: {e}")
+            st.error(f"SQLite database initialization failed: {e}")
             st.stop()
 
     render_stats()
 
-    # ── Sample questions ──────────────────────────────────────────────────────
     with st.container():
         render_sample_questions()
 
     st.markdown("<br/>", unsafe_allow_html=True)
 
-    # ── Question input ────────────────────────────────────────────────────────
     run_clicked = render_question_input()
 
     if run_clicked:
@@ -562,23 +525,17 @@ def main():
                     agent = _get_agent()
                     result = agent.ask(question)
                 except ValueError as exc:
-                    # API key not configured / invalid
                     st.error(f"⚙️ Configuration error: {exc}")
                     st.info(
-                       "Please check your `.env` file:\n"
-                       "- Set `GROQ_API_KEY` to your actual Groq API key.\n"
-                       "- Set `DB_PASSWORD` to your MySQL password."
+                        "Configure `GROQ_API_KEY` in your local `.env` file "
+                        "or in Streamlit Cloud → App settings → Secrets."
                     )
                     st.stop()
-                except ConnectionError as exc:
-                    st.error(f"🔌 Connection error: {exc}")
-                    st.stop()
                 except Exception as exc:
-                    st.error(f"❌ Unexpected error: {exc}")
+                    st.error(f"❌ Query failed: {exc}")
                     st.stop()
 
-                elapsed = time.perf_counter() - t0
-                result["elapsed"] = elapsed
+                result["elapsed"] = time.perf_counter() - t0
 
             st.session_state.result = result
             st.session_state.history.append(
@@ -592,26 +549,27 @@ def main():
     if st.session_state.result:
         render_result(st.session_state.result)
         if "elapsed" in st.session_state.result:
-            st.caption(f"⏱ Query completed in {st.session_state.result['elapsed']:.2f}s")
+            st.caption(
+                f"⏱ Query completed in {st.session_state.result['elapsed']:.2f}s"
+            )
 
-    # ── About section ─────────────────────────────────────────────────────────
     with st.expander("ℹ️ About this application"):
         st.markdown(
             """
-**Text-to-SQL Agent** is a beginner-friendly AI assistant that converts
-natural-language questions into SQL queries using a large language model.
+**Text-to-SQL Agent** converts natural-language questions into SQL queries
+using Groq and executes validated read-only queries against SQLite.
 
 | Feature | Detail |
 |---|---|
-| LLM Providers | Google Gemini, Groq (Llama 3) |
-| Database | SQLite (default) · MySQL · PostgreSQL |
+| LLM Provider | Groq (`openai/gpt-oss-120b`) |
+| Database | SQLite |
 | ORM | SQLAlchemy |
-| Safety | Only SELECT queries execute. All DDL/DML is blocked. |
-| Data | 23 employees · 7 departments · salary records |
+| Safety | Only SELECT queries execute. DDL/DML is blocked. |
+| Sample Data | 23 employees · 7 departments · salary records |
 
 **Architecture**
 ```
-User question → LLM (Gemini/Groq) → SQL → safety validation → read-only execution → results
+User question → Groq AI → SQL → safety validation → SQLite execution → results
 ```
             """
         )

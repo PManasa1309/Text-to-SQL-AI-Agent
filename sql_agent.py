@@ -3,12 +3,12 @@ sql_agent.py — LLM-powered Text-to-SQL translation and safe query execution.
 
 Responsibilities
 ----------------
-* Load Google Gemini via LangChain.
-* Build a prompt that includes the full MySQL schema + sample rows so the
-  model has enough context to write accurate MySQL SQL.
+* Load Groq via LangChain.
+* Build a prompt that includes the full SQLite schema + sample rows so the
+  model has enough context to write accurate SQLite SQL.
 * Parse the model response and extract a clean SQL statement.
 * Validate that only safe SELECT queries are allowed (block all DML/DDL).
-* Execute the query against MySQL and return results as a Pandas DataFrame.
+* Execute the query against SQLite and return results as a Pandas DataFrame.
 """
 
 import re
@@ -70,9 +70,9 @@ def _load_llm():
 # ─── System prompt builder ────────────────────────────────────────────────────
 
 _SYSTEM_PROMPT_TEMPLATE = """\
-You are an expert MySQL SQL assistant.
+You are an expert SQLite SQL assistant.
 Your ONLY job is to convert the user's natural-language question into a single
-valid MySQL SELECT query for the database described below.
+valid SQLite SELECT query for the database described below.
 
 STRICT RULES — follow every one:
 1. Output ONLY a raw SQL SELECT statement.
@@ -82,15 +82,17 @@ STRICT RULES — follow every one:
 2. NEVER output INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE,
    REPLACE, MERGE, EXEC, GRANT, REVOKE, LOAD, or any data-modification statement.
 3. Use table and column names EXACTLY as shown in the schema below.
-4. Enclose table and column names in backticks if they might clash with MySQL
-   reserved words (e.g. `name`, `date`).
-5. Use explicit JOIN … ON … syntax (never implicit comma joins).
+4. Use double quotes for identifiers only when needed; do not use MySQL-specific syntax.
+5. Use explicit JOIN ... ON ... syntax (never implicit comma joins).
 6. Add LIMIT {max_rows} if the query could return many rows.
-7. Use MySQL-compatible syntax:
-   - DATE functions: YEAR(), MONTH(), DATE_FORMAT(), DATEDIFF(), CURDATE()
-   - String: CONCAT(), LIKE, LOWER(), UPPER()
-   - NULL checks: IS NULL, IS NOT NULL
-   - Avoid SQLite-specific syntax (no strftime, no IFNULL→use COALESCE).
+7. Use SQLite-compatible syntax:
+   - Date functions: date(), datetime(), strftime(), julianday()
+   - Current date: date('now')
+   - String functions: LIKE, LOWER(), UPPER(), SUBSTR()
+   - String concatenation: ||
+   - NULL handling: IS NULL, IS NOT NULL, COALESCE(), IFNULL()
+   - Do not use MySQL-only functions such as YEAR(), MONTH(), DATE_FORMAT(),
+     CURDATE(), or CONCAT().
 8. If the question cannot be answered with the available schema, output exactly:
    UNABLE_TO_ANSWER
 
@@ -120,7 +122,7 @@ def _build_system_prompt(db_url: Optional[str] = None) -> str:
 
 # ─── SQL extraction & validation ──────────────────────────────────────────────
 def _content_to_text(content) -> str:
-    """Convert Gemini's response content into plain text."""
+    """Convert the model response content into plain text."""
     if isinstance(content, str):
         return content.strip()
 
@@ -188,7 +190,7 @@ def _validate_sql(sql: str) -> Tuple[bool, str]:
 # ─── Main public class ────────────────────────────────────────────────────────
 
 class TextToSQLAgent:
-    """Stateful agent: English question → MySQL SQL → results DataFrame."""
+    """Stateful agent: English question → SQLite SQL → results DataFrame."""
 
     def __init__(self, db_url: Optional[str] = None):
         self.db_url = db_url or get_database_url()
@@ -206,7 +208,7 @@ class TextToSQLAgent:
         """Return (sql, raw_llm_response).
 
         Raises ValueError if the LLM is not configured.
-        Raises ConnectionError if the Gemini API is unreachable.
+        Raises ConnectionError if the Groq API is unreachable.
         """
         system_prompt = _build_system_prompt(self.db_url)
         messages = [
@@ -217,26 +219,26 @@ class TextToSQLAgent:
             response = self.llm.invoke(messages)
         except Exception as exc:
             err_str = str(exc).lower()
-            if "api key" in err_str or "invalid" in err_str or "401" in err_str:
-                 raise ValueError(
-                     "Groq API key is invalid or expired. "
-                     "Please check GROQ_API_KEY in your .env file."
-                 ) from exc
-            if "quota" in err_str or "429" in err_str or "resource exhausted" in err_str:
+            if "api key" in err_str or "authentication" in err_str or "401" in err_str:
+                raise ValueError(
+                    "Groq API authentication failed. Check GROQ_API_KEY in your "
+                    "Streamlit Secrets or local .env file."
+                ) from exc
+            if "quota" in err_str or "429" in err_str or "rate limit" in err_str:
                 raise ConnectionError(
-                    "Gemini API quota exceeded. Please wait a moment and try again, "
-                    "or check your usage at https://aistudio.google.com."
+                    "Groq rate limit or quota reached. Wait and try again, or "
+                    "check your usage at https://console.groq.com."
                 ) from exc
             if "connection" in err_str or "timeout" in err_str or "network" in err_str:
                 raise ConnectionError(
-                    "Cannot reach the Gemini API. Check your internet connection."
+                    "Cannot reach the Groq API. Check your internet connection."
                 ) from exc
             raise
 
         raw = _content_to_text(response.content)
 
         if not raw:
-            raise ValueError("Gemini returned an empty response. Please try again.")
+            raise ValueError("Groq returned an empty response. Please try again.")
 
         sql = _extract_sql(raw)
         return sql, raw
@@ -327,34 +329,32 @@ class TextToSQLAgent:
 # ─── Error formatting ─────────────────────────────────────────────────────────
 
 def _friendly_error(raw: str) -> str:
-    """Convert cryptic SQLAlchemy/MySQL errors into user-friendly messages."""
+    """Convert SQLite errors into user-friendly messages."""
     low = raw.lower()
 
-    if "doesn't exist" in low and "table" in low:
-        m = re.search(r"table '[\w.]*?\.?(\w+)' doesn't exist", low)
-        name = m.group(1) if m else "unknown"
-        return f"Table '{name}' does not exist in the database."
+    if "no such table" in low:
+        match = re.search(r"no such table:\\s*([\\w.]+)", raw, re.IGNORECASE)
+        name = match.group(1) if match else "unknown"
+        return f"Table '{name}' does not exist in the SQLite database."
 
-    if "unknown column" in low:
-        m = re.search(r"unknown column '([^']+)'", low)
-        name = m.group(1) if m else "unknown"
+    if "no such column" in low:
+        match = re.search(r"no such column:\\s*([\\w.]+)", raw, re.IGNORECASE)
+        name = match.group(1) if match else "unknown"
         return f"Column '{name}' does not exist in the table."
 
-    if "you have an error in your sql syntax" in low:
-        return "MySQL syntax error in the generated query. Please rephrase your question."
+    if "syntax error" in low or "no such function" in low:
+        return "SQLite query error. Please rephrase your question."
 
-    if "access denied" in low:
+    if "unable to open database file" in low:
         return (
-            "Database access denied. Check DB_USER and DB_PASSWORD in your .env file."
+            "SQLite cannot open its database file. Check that the app has "
+            "permission to write to its project directory."
         )
 
-    if "can't connect" in low or "connection refused" in low:
-        return (
-            "Cannot connect to MySQL. Make sure the MySQL service is running "
-            "and DB_HOST / DB_PORT are correct in your .env file."
-        )
+    if "database is locked" in low:
+        return "The SQLite database is busy. Please try again."
 
     if "operationalerror" in low:
-        return f"Database operational error: {raw}"
+        return f"SQLite operational error: {raw}"
 
     return raw
